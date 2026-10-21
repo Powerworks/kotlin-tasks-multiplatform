@@ -1,0 +1,16 @@
+flowchart LR
+    UI[UI Layer] -->|collects| Flow[StateFlow<List<Task>>]
+    Flow --> Repo[InMemoryTaskRepository<br/>actor-equivalent]
+    Repo -->|serialized access| Store[(ConcurrentHashMap)]
+    Repo -->|push/pull| Sync[SyncService]
+    Sync -->|network| API[(Remote API)]
+    Sync -.->|merge result| Repo
+    
+    UC[Use Cases<br/>CreateTask, CompleteTask, SyncTasks] --> Repo
+    
+    style Repo fill:#bbf,stroke:#333
+    style Sync fill:#bbf,stroke:#333
+    style UI fill:#bfb,stroke:#333
+    style Store fill:#f9f,stroke:#333
+    style API fill:#f9f,stroke:#333
+    style Flow fill:#ffb,stroke:#333
