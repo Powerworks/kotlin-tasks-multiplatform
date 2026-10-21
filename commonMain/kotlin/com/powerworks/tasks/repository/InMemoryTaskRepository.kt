@@ -1,6 +1,7 @@
 package com.powerworks.tasks.repository
 
 import com.powerworks.tasks.model.Task
+import com.powerworks.tasks.model.TaskEvent
 import com.powerworks.tasks.model.TaskRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -8,22 +9,19 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
+import java.time.Instant
 
-/**
- * In-memory implementation of [TaskRepository].
- * Local store is canonical; remote sync is asynchronous and may fail.
- * All access is serialized through a single-threaded dispatcher to avoid
- * shared mutable state — the Kotlin equivalent of an actor mailbox.
- */
 class InMemoryTaskRepository(
     private val syncService: SyncService? = null,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.Default
 ) : TaskRepository, CoroutineScope by CoroutineScope(Dispatchers.Default + SupervisorJob()) {
 
     private val tasks = ConcurrentHashMap<String, Task>()
-    private val _tasks = MutableStateFlow<List<Task>>(emptyList())
+    private val _tasksState = MutableStateFlow<List<Task>>(emptyList())
+    private val _taskEvents = MutableSharedFlow<TaskEvent>(replay = 1, extraBufferCapacity = 64)
 
-    override fun observeTasks(): Flow<List<Task>> = _tasks.asStateFlow()
+    override val tasksState: StateFlow<List<Task>> = _tasksState.asStateFlow()
+    override fun observeTasks(): Flow<TaskEvent> = _taskEvents.asSharedFlow()
 
     override suspend fun getAll(): List<Task> = withContext(ioDispatcher) {
         tasks.values.filter { !it.isDeleted }.sortedByDescending { it.modifiedAt }.toList()
@@ -38,6 +36,7 @@ class InMemoryTaskRepository(
         val stored = task.copy(createdAt = now, modifiedAt = now, isDeleted = false)
         tasks[stored.id] = stored
         publish()
+        _taskEvents.emit(TaskEvent.Success(listTasksLocked()))
         syncService?.push(stored)
         stored
     }
@@ -47,6 +46,7 @@ class InMemoryTaskRepository(
         val stored = task.copy(modifiedAt = now)
         tasks[stored.id] = stored
         publish()
+        _taskEvents.emit(TaskEvent.Success(listTasksLocked()))
         syncService?.push(stored)
         stored
     }
@@ -55,11 +55,13 @@ class InMemoryTaskRepository(
         tasks[id]?.let {
             tasks[id] = it.copy(isDeleted = true, modifiedAt = Instant.now())
             publish()
+            _taskEvents.emit(TaskEvent.Success(listTasksLocked()))
             syncService?.tombstone(id)
         }
     }
 
     override suspend fun sync() = withContext(ioDispatcher) {
+        _taskEvents.emit(TaskEvent.Loading)
         syncService?.pull()?.forEach { remote ->
             val local = tasks[remote.id]
             if (local == null || remote.modifiedAt.isAfter(local.modifiedAt)) {
@@ -67,11 +69,15 @@ class InMemoryTaskRepository(
             }
         }
         publish()
+        _taskEvents.emit(TaskEvent.Success(listTasksLocked()))
     }
 
     private fun publish() {
-        _tasks.value = tasks.values.filter { !it.isDeleted }.sortedByDescending { it.modifiedAt }.toList()
+        _tasksState.value = listTasksLocked()
     }
+
+    private fun listTasksLocked(): List<Task> =
+        tasks.values.filter { !it.isDeleted }.sortedByDescending { it.modifiedAt }.toList()
 
     override val coroutineContext: CoroutineContext
         get() = Dispatchers.Default + SupervisorJob()
