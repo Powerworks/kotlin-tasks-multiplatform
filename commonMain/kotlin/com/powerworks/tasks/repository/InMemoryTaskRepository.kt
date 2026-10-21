@@ -1,29 +1,49 @@
 package com.powerworks.tasks.repository
 
 import com.powerworks.tasks.model.Task
+import com.powerworks.tasks.model.TaskEvent
 import com.powerworks.tasks.model.TaskRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.SendChannel
 import java.util.concurrent.ConcurrentHashMap
+import java.time.Instant
 
-/**
- * In-memory implementation of [TaskRepository].
- * Local store is canonical; remote sync is asynchronous and may fail.
- * All access is serialized through a single-threaded dispatcher to avoid
- * shared mutable state — the Kotlin equivalent of an actor mailbox.
- */
 class InMemoryTaskRepository(
     private val syncService: SyncService? = null,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.Default
 ) : TaskRepository, CoroutineScope by CoroutineScope(Dispatchers.Default + SupervisorJob()) {
 
     private val tasks = ConcurrentHashMap<String, Task>()
-    private val _tasks = MutableStateFlow<List<Task>>(emptyList())
+    private val _tasksState = MutableStateFlow<List<Task>>(emptyList())
+    private val _taskEvents = MutableSharedFlow<TaskEvent>(replay = 1, extraBufferCapacity = 64)
 
-    override fun observeTasks(): Flow<List<Task>> = _tasks.asStateFlow()
+    // Channel for external sync requests — decouples caller from sync execution
+    private val syncChannel = Channel<SyncCommand>(Channel.UNLIMITED)
+
+    private sealed class SyncCommand {
+        object Pull : SyncCommand()
+        data class Push(val task: Task) : SyncCommand()
+    }
+
+    init {
+        launch {
+            for (cmd in syncChannel) {
+                when (cmd) {
+                    is SyncCommand.Pull -> doPull()
+                    is SyncCommand.Push -> syncService?.push(cmd.task)
+                }
+            }
+        }
+    }
+
+    override val tasksState: StateFlow<List<Task>> = _tasksState.asStateFlow()
+    override fun observeTasks(): Flow<TaskEvent> = _taskEvents.asSharedFlow()
 
     override suspend fun getAll(): List<Task> = withContext(ioDispatcher) {
         tasks.values.filter { !it.isDeleted }.sortedByDescending { it.modifiedAt }.toList()
@@ -38,7 +58,8 @@ class InMemoryTaskRepository(
         val stored = task.copy(createdAt = now, modifiedAt = now, isDeleted = false)
         tasks[stored.id] = stored
         publish()
-        syncService?.push(stored)
+        _taskEvents.emit(TaskEvent.Success(listTasksLocked()))
+        syncChannel.send(SyncCommand.Push(stored)) // non-blocking, structured
         stored
     }
 
@@ -47,7 +68,8 @@ class InMemoryTaskRepository(
         val stored = task.copy(modifiedAt = now)
         tasks[stored.id] = stored
         publish()
-        syncService?.push(stored)
+        _taskEvents.emit(TaskEvent.Success(listTasksLocked()))
+        syncChannel.send(SyncCommand.Push(stored))
         stored
     }
 
@@ -55,11 +77,17 @@ class InMemoryTaskRepository(
         tasks[id]?.let {
             tasks[id] = it.copy(isDeleted = true, modifiedAt = Instant.now())
             publish()
-            syncService?.tombstone(id)
+            _taskEvents.emit(TaskEvent.Success(listTasksLocked()))
         }
     }
 
     override suspend fun sync() = withContext(ioDispatcher) {
+        syncChannel.send(SyncCommand.Pull)
+        doPull()
+    }
+
+    private suspend fun doPull() {
+        _taskEvents.emit(TaskEvent.Loading)
         syncService?.pull()?.forEach { remote ->
             val local = tasks[remote.id]
             if (local == null || remote.modifiedAt.isAfter(local.modifiedAt)) {
@@ -67,11 +95,15 @@ class InMemoryTaskRepository(
             }
         }
         publish()
+        _taskEvents.emit(TaskEvent.Success(listTasksLocked()))
     }
 
     private fun publish() {
-        _tasks.value = tasks.values.filter { !it.isDeleted }.sortedByDescending { it.modifiedAt }.toList()
+        _tasksState.value = listTasksLocked()
     }
+
+    private fun listTasksLocked(): List<Task> =
+        tasks.values.filter { !it.isDeleted }.sortedByDescending { it.modifiedAt }.toList()
 
     override val coroutineContext: CoroutineContext
         get() = Dispatchers.Default + SupervisorJob()
